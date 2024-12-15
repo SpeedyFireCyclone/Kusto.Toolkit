@@ -7,8 +7,6 @@ using Kusto.Language;
 using Kusto.Language.Symbols;
 using Kusto.Data.Common;
 using System.ComponentModel;
-using System.Collections;
-
 
 namespace Kusto.Toolkit
 {
