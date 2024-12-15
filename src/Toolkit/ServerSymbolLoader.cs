@@ -109,14 +109,21 @@ namespace Kusto.Toolkit
             var connection = GetClusterConnection(clusterName);
             var provider = GetOrCreateAdminProvider(connection);
 
-            DatabaseNamesResult[] databases;
-            databases = await ExecuteControlCommandAsync<DatabaseNamesResult>(
+            DatabaseNamesResult[] databases = await ExecuteControlCommandAsync<DatabaseNamesResult>(
                 provider, database: "",
                 ".show databases",
                 throwOnError, cancellationToken)
                 .ConfigureAwait(false);
 
-            return databases.Select(d => new DatabaseName(d.DatabaseName, d.PrettyName)).ToArray();
+            var DatabaseNames = databases
+                .Select(d => new DatabaseName(d.DatabaseName, d.PrettyName))
+                .ToArray();
+
+            if (DatabaseNames.Length > 0)
+            {
+                return DatabaseNames;
+            }
+            return null;
         }
 
         private bool IsBadDatabaseName(string clusterName, string databaseName)
@@ -153,7 +160,7 @@ namespace Kusto.Toolkit
                 if (throwOnError) {
                     throw new InvalidOperationException($"Specified database name '{databaseName}' does not exist in cluster '{clusterName}'");
                 }
-                return new DatabaseSymbol(databaseName, databaseName, new List<Symbol>());
+                return null;
             }
 
             var connection = GetClusterConnection(clusterName);
@@ -167,7 +174,7 @@ namespace Kusto.Toolkit
                 {
                     throw new InvalidOperationException($"Specified database name '{databaseName}' does not exist in cluster '{clusterName}'");
                 }
-                return new DatabaseSymbol(databaseName, databaseName, new List<Symbol>());
+                return null;
             }
 
             var tables = await LoadTablesAsync(provider, dbName.Name, throwOnError, cancellationToken).ConfigureAwait(false);
@@ -202,7 +209,16 @@ namespace Kusto.Toolkit
 
             var dbInfo = dbInfos.FirstOrDefault();
 
-            return new DatabaseName(dbInfo.DatabaseName, dbInfo.PrettyName);
+            try
+            {
+                return new DatabaseName(dbInfo.DatabaseName, dbInfo.PrettyName);
+            }
+            catch (Exception)
+            {
+                if (throwOnError) throw;
+                return null;
+            }
+
         }
         private async Task<IReadOnlyList<TableSymbol>> LoadTablesAsync(ICslAdminProvider provider, string databaseName, bool throwOnError, CancellationToken cancellationToken)
         {
@@ -215,14 +231,14 @@ namespace Kusto.Toolkit
                 throwOnError, cancellationToken)
                 .ConfigureAwait(false);
             var schemaComponents = columnTableDataTypes
-                .Where(line => line.ColumnName.IsNotNullOrEmpty())
+                .Where(line => line.TableName.IsNotNullOrEmpty())
                 .GroupBy(line => line.TableName);
             tableSchemas = schemaComponents
                 .Select(component => new LoadTablesResultCSL
                 {
                     TableName = component.Key,
-                    Schema = component.Select(c => $"{c.ColumnName}:{c.ColumnTypeCSL}").StringJoin(", "),
-                    DocString = ""
+                    Schema = component.Where(line => line.ColumnName.IsNotNullOrEmpty()).Select(c => $"{c.ColumnName}:{c.ColumnTypeCSL}").StringJoin(", "),
+                    DocString = component.FirstOrDefault(c => c.DocString.IsNotNullOrEmpty())?.DocString
                 }).ToArray();
 
             var tables = tableSchemas.Select(schema => new TableSymbol(schema.TableName, "(" + schema.Schema + ")", schema.DocString)).ToList();
@@ -420,6 +436,7 @@ namespace Kusto.Toolkit
             public string ColumnType;
             public bool IsDefaultTable;
             public bool IsDefaultColumn;
+            public string PrettyName;
             public string Version;
             public string Folder;
             public string DocString;
