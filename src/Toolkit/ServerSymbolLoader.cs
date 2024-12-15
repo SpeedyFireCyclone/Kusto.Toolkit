@@ -1,4 +1,5 @@
 ﻿using Kusto.Cloud.Platform.Data;
+using Kusto.Cloud.Platform.Utils;
 using Kusto.Data;
 using Kusto.Data.Data;
 using Kusto.Data.Net.Client;
@@ -6,9 +7,8 @@ using Kusto.Language;
 using Kusto.Language.Symbols;
 using Kusto.Data.Common;
 using System.ComponentModel;
+using System.Collections;
 
-
-#nullable disable // some day...
 
 namespace Kusto.Toolkit
 {
@@ -100,7 +100,7 @@ namespace Kusto.Toolkit
         /// If the cluster name is not specified, the loader's default cluster name is used.
         /// Returns null if the cluster is not found.
         /// </summary>
-        public override async Task<IReadOnlyList<DatabaseName>> LoadDatabaseNamesAsync(string clusterName = null, bool throwOnError = false, CancellationToken cancellationToken = default)
+        public override async Task<IReadOnlyList<DatabaseName>> LoadDatabaseNamesAsync(string? clusterName = null, bool throwOnError = false, CancellationToken cancellationToken = default)
         {
             clusterName = string.IsNullOrEmpty(clusterName)
                 ? _defaultClusterName
@@ -109,13 +109,14 @@ namespace Kusto.Toolkit
             var connection = GetClusterConnection(clusterName);
             var provider = GetOrCreateAdminProvider(connection);
 
-            var databases = await ExecuteControlCommandAsync<DatabaseNamesResult>(
-                provider, database: "", 
-                ".show databases | project DatabaseName, PrettyName",
+            DatabaseNamesResult[] databases;
+            databases = await ExecuteControlCommandAsync<DatabaseNamesResult>(
+                provider, database: "",
+                ".show databases",
                 throwOnError, cancellationToken)
                 .ConfigureAwait(false);
 
-            return databases?.Select(d => new DatabaseName(d.DatabaseName, d.PrettyName)).ToArray();
+            return databases.Select(d => new DatabaseName(d.DatabaseName, d.PrettyName)).ToArray();
         }
 
         private bool IsBadDatabaseName(string clusterName, string databaseName)
@@ -140,18 +141,20 @@ namespace Kusto.Toolkit
         /// If the cluster name is not specified, the loader's default cluster name is used.
         /// Returns null if the database is not found.
         /// </summary>
-        public override async Task<DatabaseSymbol> LoadDatabaseAsync(string databaseName, string clusterName = null, bool throwOnError = false, CancellationToken cancellationToken = default)
+        public override async Task<DatabaseSymbol> LoadDatabaseAsync(string databaseName, string? clusterName = null, bool throwOnError = false, CancellationToken cancellationToken = default)
         {
-            if (databaseName == null)
-                throw new ArgumentNullException(nameof(databaseName));
-
             clusterName = string.IsNullOrEmpty(clusterName)
                 ? _defaultClusterName
                 : GetFullHostName(clusterName, _defaultDomain);
 
             // if we've already determined this database name is bad, then bail out
             if (IsBadDatabaseName(clusterName, databaseName))
-                return null;
+            {
+                if (throwOnError) {
+                    throw new InvalidOperationException($"Specified database name '{databaseName}' does not exist in cluster '{clusterName}'");
+                }
+                return new DatabaseSymbol(databaseName, databaseName, new List<Symbol>());
+            }
 
             var connection = GetClusterConnection(clusterName);
             var provider = GetOrCreateAdminProvider(connection);
@@ -160,7 +163,11 @@ namespace Kusto.Toolkit
             if (dbName == null)
             {
                 AddBadDatabaseName(clusterName, databaseName);
-                return null;
+                if (throwOnError)
+                {
+                    throw new InvalidOperationException($"Specified database name '{databaseName}' does not exist in cluster '{clusterName}'");
+                }
+                return new DatabaseSymbol(databaseName, databaseName, new List<Symbol>());
             }
 
             var tables = await LoadTablesAsync(provider, dbName.Name, throwOnError, cancellationToken).ConfigureAwait(false);
@@ -185,31 +192,38 @@ namespace Kusto.Toolkit
         /// </summary>
         private async Task<DatabaseName> GetBothDatabaseNamesAsync(ICslAdminProvider provider, string databaseNameOrPrettyName, bool throwOnError, CancellationToken cancellationToken)
         {
-            var dbInfos = await ExecuteControlCommandAsync<DatabaseNamesResult>(
+            DatabaseNamesResult[] dbInfos;
+            dbInfos = await ExecuteControlCommandAsync<DatabaseNamesResult>(
                 provider,
                 database: databaseNameOrPrettyName,
-                $".show database identity | project DatabaseName, PrettyName",
+                ".show database identity",
                 throwOnError, cancellationToken)
                 .ConfigureAwait(false);
 
-            var dbInfo = dbInfos?.FirstOrDefault();
+            var dbInfo = dbInfos.FirstOrDefault();
 
-            return dbInfo != null
-                ? new DatabaseName(dbInfo.DatabaseName, dbInfo.PrettyName)
-                : null;
+            return new DatabaseName(dbInfo.DatabaseName, dbInfo.PrettyName);
         }
-
         private async Task<IReadOnlyList<TableSymbol>> LoadTablesAsync(ICslAdminProvider provider, string databaseName, bool throwOnError, CancellationToken cancellationToken)
         {
-            // get table schema from .show database xxx cslschema
-            var tableSchemas = await ExecuteControlCommandAsync<LoadTablesResult>(
+            LoadTablesResultCSL[] tableSchemas;
+
+            // get table schema from .show database xxx schema
+            var columnTableDataTypes = await ExecuteControlCommandAsync<LoadTablesResult>(
                 provider, databaseName,
-                $".show database {KustoFacts.GetBracketedName(databaseName)} cslschema | project TableName, Schema, DocString",
+                $".show database {KustoFacts.GetBracketedName(databaseName)} schema",
                 throwOnError, cancellationToken)
                 .ConfigureAwait(false);
-
-            if (tableSchemas == null)
-                return null;
+            var schemaComponents = columnTableDataTypes
+                .Where(line => line.ColumnName.IsNotNullOrEmpty())
+                .GroupBy(line => line.TableName);
+            tableSchemas = schemaComponents
+                .Select(component => new LoadTablesResultCSL
+                {
+                    TableName = component.Key,
+                    Schema = component.Select(c => $"{c.ColumnName}:{c.ColumnTypeCSL}").StringJoin(", "),
+                    DocString = ""
+                }).ToArray();
 
             var tables = tableSchemas.Select(schema => new TableSymbol(schema.TableName, "(" + schema.Schema + ")", schema.DocString)).ToList();
             return tables;
@@ -283,13 +297,13 @@ namespace Kusto.Toolkit
 
             // get functions for .show functions
             var functionSchemas = await ExecuteControlCommandAsync<LoadFunctionsResult>(
-                provider, databaseName, 
-                ".show functions | project Name, Parameters, Body, DocString", 
+                provider, databaseName,
+                ".show functions", 
                 throwOnError, cancellationToken)
                 .ConfigureAwait(false);
 
             if (functionSchemas == null)
-                return null;
+                return functions;
 
             foreach (var fun in functionSchemas)
             {
@@ -312,7 +326,7 @@ namespace Kusto.Toolkit
                 .ConfigureAwait(false);
 
             if (entityGroups == null)
-                return null;
+                return entityGroupSymbols;
 
             return entityGroups.Select(eg => new EntityGroupSymbol(eg.Name, eg.Entities)).ToList();
         }
@@ -336,11 +350,11 @@ namespace Kusto.Toolkit
                     return objectReader.ToArray();
                 }
 
-                return null;
+                return new List<T>().ToArray();
             }
             catch (Exception) when (!throwOnError)
             {
-                return null;
+                return new List<T>().ToArray();
             }
         }
 
@@ -379,15 +393,51 @@ namespace Kusto.Toolkit
 
         public class DatabaseNamesResult
         {
-            public string DatabaseName;
-            public string PrettyName;
+            public string DatabaseName = "default";
+            public string? PersistentStorage;
+            public string? Version;
+            public Int16 IsCurrent;
+            public string? DatabaseAccessMode;
+            public string PrettyName = "default";
+            public Int16 CurrentUserIsUnrestrictedViewer;
+            public string? DatabaseId;
+            public string? InTransitionTo;
+            public string? SuspensionState;
+        }
+
+        public class LoadTablesResultCSL
+        {
+            public string TableName;
+            public string Schema;
+            public string DocString = "";
         }
 
         public class LoadTablesResult
         {
+            public string DatabaseName;
             public string TableName;
-            public string Schema;
+            public string ColumnName;
+            public string ColumnType;
+            public bool IsDefaultTable;
+            public bool IsDefaultColumn;
+            public string Version;
+            public string Folder;
             public string DocString;
+
+            private static Dictionary<string, string> _typeToCSL = new Dictionary<string, string>()
+            {
+                { "System.SByte", "bool" },
+                { "System.DateTime", "datetime" },
+                { "System.Data.SqlTypes.SqlDecimal", "decimal" },
+                { "System.Object", "dynamic" },
+                { "System.Guid", "guid" },
+                { "System.Int32", "int" },
+                { "System.Int64", "long" },
+                { "System.Double", "real" },
+                { "System.String", "string" },
+                { "System.TimeSpan", "timespan" }
+            };
+            public string ColumnTypeCSL => _typeToCSL[ColumnType];
         }
 
         public class LoadExternalTablesResult1
@@ -420,6 +470,7 @@ namespace Kusto.Toolkit
             public string Name;
             public string Parameters;
             public string Body;
+            public string Folder;
             public string DocString;
         }
 
